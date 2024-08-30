@@ -90,3 +90,6 @@ Thumbs.db
 uploads/
 
 package-lock.json
+
+#data
+data/
