@@ -4,6 +4,7 @@ import path from 'path';
 import uploadRoutes from './routes/routes.js';
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'url';
+import './models/requestStatus.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

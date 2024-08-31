@@ -3,7 +3,7 @@ import multer from 'multer';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
-import * as uploadController from '../controllers/uploadController.js';
+import { processCSV, getStatus } from '../controllers/uploadController.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -19,6 +19,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
-router.post('/upload', upload.single('csv'), uploadController.processCSV);
+router.post('/upload', upload.single('csv'), express.json(), processCSV);
+router.get('/status/:requestId', getStatus);
 
 export default router;

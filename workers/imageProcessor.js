@@ -1,7 +1,6 @@
 import { parentPort, workerData } from 'worker_threads';
 import sharp from 'sharp';
 import path from 'path';
-import { promises as fs } from 'fs';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
