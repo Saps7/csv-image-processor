@@ -1,18 +1,59 @@
-import fs from 'fs';
-import { promises as fsPromises } from 'fs';
 import { parse } from 'csv-parse/sync';
 import { stringify } from 'csv-stringify/sync';
-import { Worker } from 'worker_threads';
+import fs from 'fs/promises';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import axios from 'axios';
 import Product from '../models/product.js';
-import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import RequestStatus from '../models/requestStatus.js';
 import FormData from 'form-data';
+import AWS from 'aws-sdk';
+import { Readable } from 'stream';
+import { Worker } from 'worker_threads';
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
+const __dirname = path.dirname(__filename);
+
+// Configure AWS
+AWS.config.update({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION
+});
+
+const s3 = new AWS.S3();
+
+// Function to upload file to S3
+async function uploadToS3(fileContent, key) {
+  const params = {
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: key,
+    Body: fileContent
+  };
+
+  return new Promise((resolve, reject) => {
+    s3.upload(params, (err, data) => {
+      if (err) reject(err);
+      else resolve(data.Location);
+    });
+  });
+}
+
+// Function to download file from S3
+async function downloadFromS3(key) {
+  const params = {
+    Bucket: process.env.S3_BUCKET_NAME,
+    Key: key
+  };
+
+  return new Promise((resolve, reject) => {
+    s3.getObject(params, (err, data) => {
+      if (err) reject(err);
+      else resolve(data.Body);
+    });
+  });
+}
 
 function isValidImageUrl(url) {
   const validExtensions = ['.jpg', '.jpeg', '.png'];
@@ -46,13 +87,13 @@ export const processCSV = async (req, res) => {
   }
 
   try {
-    const fileContent = await fsPromises.readFile(req.file.path, 'utf8');
-    let records;
-    try {
-      records = parse(fileContent, { columns: true, skip_empty_lines: true });
-    } catch (parseError) {
-      return res.status(400).json({ error: 'CSV Format error' });
-    }
+    // Upload CSV to S3 directly from the buffer
+    const csvKey = `input/${Date.now()}_${req.file.originalname}`;
+    await uploadToS3(req.file.buffer, csvKey);
+
+    // Parse CSV content from the buffer
+    const fileContent = req.file.buffer.toString('utf8');
+    let records = parse(fileContent, { columns: true, skip_empty_lines: true });
 
     const requestId = Date.now().toString();
     
@@ -60,7 +101,7 @@ export const processCSV = async (req, res) => {
     await RequestStatus.create({ requestId, status: 'processing' });
 
     // Start asynchronous processing
-    processRecordsAsync(requestId, records, req.get('host'), webhookUrl);
+    processRecordsAsync(requestId, records, webhookUrl);
 
     res.json({ message: 'Processing started', requestId });
   } catch (error) {
@@ -69,7 +110,7 @@ export const processCSV = async (req, res) => {
   }
 };
 
-async function processRecordsAsync(requestId, records, host, webhookUrl) {
+async function processRecordsAsync(requestId, records, webhookUrl) {
   try {
     const results = await Promise.all(records.map(async record => {
       if (!record['Product Name'] || !record['Input Image Urls']) {
@@ -81,9 +122,10 @@ async function processRecordsAsync(requestId, records, host, webhookUrl) {
       }
       const downloadedPaths = await Promise.all(inputUrls.map(async url => {
         const fileName = path.basename(new URL(url).pathname);
-        const filePath = path.join(__dirname, '..', 'uploads', 'input', fileName);
-        await downloadImage(url, filePath);
-        return filePath;
+        const key = `input/${requestId}_${fileName}`;
+        const response = await axios.get(url, { responseType: 'arraybuffer' });
+        await uploadToS3(response.data, key);
+        return key;
       }));
       return {
         productName: record['Product Name'],
@@ -93,57 +135,56 @@ async function processRecordsAsync(requestId, records, host, webhookUrl) {
       };
     }));
 
-    processImagesAsync(requestId, results, host, webhookUrl);
+    processImagesAsync(requestId, results, webhookUrl);
   } catch (error) {
     console.error('Error processing records:', error);
     await RequestStatus.findOneAndUpdate(
       { requestId },
       { status: 'failed', error: error.message }
     );
+    await triggerWebhook(requestId, null, webhookUrl, error.message);
   }
 }
 
-function processImagesAsync(requestId, results, host, webhookUrl) {
-  const worker = new Worker('./workers/imageProcessor.js', {
-    workerData: results.flatMap(r => r.downloadedPaths)
-  });
+function processImagesAsync(requestId, results, webhookUrl) {
+  const worker = new Worker(new URL('../workers/imageProcessor.js', import.meta.url));
+
+  worker.postMessage({ results, bucketName: process.env.S3_BUCKET_NAME });
 
   worker.on('message', async (outputUrls) => {
     try {
-      let urlIndex = 0;
-      for (const result of results) {
-        const recordOutputUrls = outputUrls.slice(urlIndex, urlIndex + result.inputImageUrls.length);
-        result.outputImageUrls = recordOutputUrls.filter(url => url !== null);
-        urlIndex += result.inputImageUrls.length;
+      // Update results with output URLs
+      results.forEach((result, index) => {
+        result.outputImageUrls = outputUrls[index];
+      });
 
-        // Save to MongoDB
-        try {
-          const product = new Product({
-            productName: result.productName,
-            inputImages: result.inputImageUrls.map((url, i) => ({
-              url: url,
-              storagePath: result.downloadedPaths[i]
-            })),
-            outputImages: result.outputImageUrls.map(url => ({
-              url: `http://${host}${url}`,
-              storagePath: path.join(__dirname, '..', url)
-            })),
-            processedAt: new Date()
-          });
-          await product.save();
-        } catch (error) {
-          console.error(`Error saving product ${result.productName} to MongoDB:`, error);
-        }
+      // Save to MongoDB
+      for (const result of results) {
+        const product = new Product({
+          productName: result.productName,
+          inputImages: result.inputImageUrls.map((url, i) => ({
+            url: url,
+            storagePath: result.downloadedPaths[i]
+          })),
+          outputImages: result.outputImageUrls.map(url => ({
+            url: url,
+            storagePath: url.replace(`https://${process.env.S3_BUCKET_NAME}.s3.amazonaws.com/`, '')
+          })),
+          processedAt: new Date()
+        });
+        await product.save();
       }
 
       // Generate output CSV
       const csvOutput = stringify(results.map(r => ({
         'Product Name': r.productName,
         'Input Image Urls': r.inputImageUrls.join(','),
-        'Output Image Urls': r.outputImageUrls.map(url => `http://${host}${url}`).join(',')
+        'Output Image Urls': r.outputImageUrls.join(',')
       })), { header: true });
-      const outputCsvPath = path.join(__dirname, '..', 'uploads', `${requestId}_output.csv`);
-      await fsPromises.writeFile(outputCsvPath, csvOutput);
+
+      // Upload CSV to S3
+      const csvKey = `output/${requestId}_output.csv`;
+      await uploadToS3(Buffer.from(csvOutput), csvKey);
 
       // Update status to completed
       await RequestStatus.findOneAndUpdate(
@@ -152,7 +193,7 @@ function processImagesAsync(requestId, results, host, webhookUrl) {
       );
 
       // Trigger webhook
-      await triggerWebhook(requestId, outputCsvPath, webhookUrl);
+      await triggerWebhook(requestId, csvKey, webhookUrl);
 
       console.log(`Processing completed for request ${requestId}`);
     } catch (error) {
@@ -193,7 +234,7 @@ export const getStatus = async (req, res) => {
   }
 };
 
-async function triggerWebhook(requestId, csvPath, webhookUrl, error = null) {
+async function triggerWebhook(requestId, csvKey, webhookUrl, error = null) {
   if (!webhookUrl) {
     console.log('No webhook URL provided');
     return;
@@ -202,11 +243,17 @@ async function triggerWebhook(requestId, csvPath, webhookUrl, error = null) {
   const form = new FormData();
   form.append('requestId', requestId);
   
-  if (csvPath) {
-    form.append('csv', fs.createReadStream(csvPath), {
-      filename: `${requestId}_output.csv`,
-      contentType: 'text/csv',
-    });
+  if (csvKey) {
+    try {
+      const csvContent = await downloadFromS3(csvKey);
+      form.append('csv', csvContent, {
+        filename: `${requestId}_output.csv`,
+        contentType: 'text/csv',
+      });
+    } catch (downloadError) {
+      console.error(`Error downloading CSV from S3: ${downloadError}`);
+      form.append('error', 'Error retrieving CSV file');
+    }
   }
   
   if (error) {

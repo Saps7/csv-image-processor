@@ -11,6 +11,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "aws-sdk": "^2.1687.0",
     "axios": "^1.7.5",
     "csv-parse": "^5.5.6",
     "csv-stringify": "^6.5.1",

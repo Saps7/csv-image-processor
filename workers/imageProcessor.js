@@ -1,44 +1,58 @@
-import { parentPort, workerData } from 'worker_threads';
+import { parentPort } from 'worker_threads';
 import sharp from 'sharp';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import AWS from 'aws-sdk';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+AWS.config.update({
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  region: process.env.AWS_REGION
+});
 
-async function processImage(inputPath) {
-  const fileName = path.basename(inputPath);
-  const outputPath = path.join(__dirname, '..', 'uploads', 'output', fileName);
+const s3 = new AWS.S3();
+
+async function processImage(inputKey, bucketName) {
+  const outputKey = inputKey.replace('input/', 'output/');
 
   try {
-    const image = sharp(inputPath);
+    const inputImage = await s3.getObject({ Bucket: bucketName, Key: inputKey }).promise();
+    const image = sharp(inputImage.Body);
     const metadata = await image.metadata();
 
     let compressedImage;
     switch (metadata.format) {
       case 'jpeg':
       case 'jpg':
-        compressedImage = image.jpeg({ quality: 60 });
+        compressedImage = await image.jpeg({ quality: 60 }).toBuffer();
         break;
       case 'png':
-        compressedImage = image.png({ quality: 60 });
+        compressedImage = await image.png({ quality: 60 }).toBuffer();
         break;
       default:
         throw new Error('Unsupported image format');
     }
 
-    await compressedImage.toFile(outputPath);
-    return `/uploads/output/${fileName}`; // This is the path that will be served statically
+    await s3.putObject({
+      Bucket: bucketName,
+      Key: outputKey,
+      Body: compressedImage,
+      ContentType: `image/${metadata.format}`
+    }).promise();
+
+    return `https://${bucketName}.s3.amazonaws.com/${outputKey}`;
   } catch (error) {
-    console.error(`Error processing image ${fileName}:`, error);
+    console.error(`Error processing image ${inputKey}:`, error);
     return null;
   }
 }
 
-async function processImages(images) {
-  const results = await Promise.all(images.map(processImage));
-  const validResults = results.filter(result => result !== null);
-  parentPort.postMessage(validResults);
-}
-
-processImages(workerData);
+parentPort.on('message', async ({ results, bucketName }) => {
+  try {
+    const processedResults = await Promise.all(results.map(async (result) => {
+      const outputUrls = await Promise.all(result.downloadedPaths.map(path => processImage(path, bucketName)));
+      return outputUrls.filter(url => url !== null);
+    }));
+    parentPort.postMessage(processedResults);
+  } catch (error) {
+    parentPort.postMessage({ error: error.message });
+  }
+});
