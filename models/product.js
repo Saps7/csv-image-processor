@@ -1,14 +1,15 @@
 import mongoose from 'mongoose';
 
 const productSchema = new mongoose.Schema({
+  sNo: Number,
   productName: String,
   inputImages: [{
     url: String,
-    storagePath: String  // Path in your file storage system
+    storagePath: String
   }],
   outputImages: [{
     url: String,
-    storagePath: String  // Path in your file storage system
+    storagePath: String
   }],
   processedAt: Date
 });

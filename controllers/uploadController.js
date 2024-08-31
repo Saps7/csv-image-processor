@@ -85,20 +85,33 @@ export const processCSV = async (req, res) => {
         res.json({ message: 'Processing started', requestId });
     } catch (error) {
         console.error('Error processing CSV:', error);
-        res.status(500).json({ error: 'Error processing CSV file' });
+        res.status(400).json({ error: error.message });
     }
 };
 
 async function processRecordsAsync(requestId, records, webhookUrl) {
     try {
-        const results = await Promise.all(records.map(async record => {
-            if (!record['Product Name'] || !record['Input Image Urls']) {
-                throw new Error('CSV Format error');
+        const results = await Promise.all(records.map(async (record, index) => {
+            // Check for missing or empty required fields
+            if (!record['S. No.'] || !record['Product Name'] || !record['Input Image Urls']) {
+                throw new Error(`CSV Format error: Missing required columns in row ${index + 1}`);
             }
+
+            // Check if S. No. is a valid number
+            if (isNaN(parseInt(record['S. No.']))) {
+                throw new Error(`CSV Format error: S. No. must be a number in row ${index + 1}`);
+            }
+
+            // Check if Product Name is not empty
+            if (record['Product Name'].trim() === '') {
+                throw new Error(`CSV Format error: Product Name cannot be empty in row ${index + 1}`);
+            }
+
             const inputUrls = record['Input Image Urls'].split(',').map(url => url.trim());
-            if (inputUrls.some(url => !isValidImageUrl(url))) {
-                throw new Error('CSV Format error');
+            if (inputUrls.length === 0 || inputUrls.some(url => !isValidImageUrl(url))) {
+                throw new Error(`CSV Format error: Invalid or missing image URL(s) in row ${index + 1}`);
             }
+
             const downloadedPaths = await Promise.all(inputUrls.map(async url => {
                 const fileName = path.basename(new URL(url).pathname);
                 const key = `input/${requestId}_${fileName}`;
@@ -106,8 +119,10 @@ async function processRecordsAsync(requestId, records, webhookUrl) {
                 await uploadToS3(response.data, key);
                 return key;
             }));
+
             return {
-                productName: record['Product Name'],
+                sNo: record['S. No.'],
+                productName: record['Product Name'].trim(),
                 inputImageUrls: inputUrls,
                 downloadedPaths,
                 outputImageUrls: []
@@ -140,6 +155,7 @@ function processImagesAsync(requestId, results, webhookUrl) {
             // Save to MongoDB
             for (const result of results) {
                 const product = new Product({
+                    sNo: result.sNo,
                     productName: result.productName,
                     inputImages: result.inputImageUrls.map((url, i) => ({
                         url: url,
@@ -156,6 +172,7 @@ function processImagesAsync(requestId, results, webhookUrl) {
 
             // Generate output CSV
             const csvOutput = stringify(results.map(r => ({
+                'S. No.': r.sNo,
                 'Product Name': r.productName,
                 'Input Image Urls': r.inputImageUrls.join(','),
                 'Output Image Urls': r.outputImageUrls.join(',')
